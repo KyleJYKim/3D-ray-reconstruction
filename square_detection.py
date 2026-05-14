@@ -193,6 +193,7 @@ def detect_laser_points(frame, rect_top_img, rect_btm_img):
     for p in pts_btm:
         cv.circle(vis, (int(p[0]), int(p[1])), 5, (255, 0, 255), -1)   # magenta
     cv.imshow("laser points", vis)
+    # cv.waitKey(0)
 
     return pts_top, pts_btm   # two lists of np.array([x, y, 1])
 
@@ -214,12 +215,18 @@ def ray_plane_intersect(pt_h, K, plane_pt, plane_n):
     plane_pt  = plane_pt.ravel()
     denom     = d @ plane_n
 
-    if abs(denom) < 1e-9:   # ray parallel to plane
+    if abs(denom) < 1e-9:
+        print("ray parallel to plane")
         return None
-    t = (plane_pt @ plane_n) / denom
-    if t < 0:               # intersection behind camera
-        return None
-    return t * d            # (3,) in camera coordinates
+    
+    z = (plane_pt @ plane_n) / denom
+    
+    if z < 0:
+        print("intersection behind camera")
+        z = z * -1
+        # return None
+    
+    return z * d  # (3,) in camera coordinates
 
 
 def fit_plane_svd(points_3d: list) -> tuple:

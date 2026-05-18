@@ -398,6 +398,7 @@ def main():
         if line_pt_btm is not None:
             print(f"  Laser line on table : point={line_pt_btm}  dir={line_dir_btm}")
 
+        # Need to find the red line on the object!!! and intersect with laser plane
 
     analysis_vid.release()
     cv.destroyAllWindows()

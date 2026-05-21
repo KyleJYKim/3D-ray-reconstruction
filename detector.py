@@ -267,9 +267,6 @@ def main():
     rect_H_top = None
     rect_H_btm = None
 
-    # Simple namespace to accumulate calibration points across frames
-    class run_state: pass
-
     pts_file = open("points_raw.txt", "w")
     running = True
 
@@ -354,30 +351,12 @@ def main():
         print(f"3D top: {len(top_pts3d)} pt(s)")
         print(f"3D btm: {len(btm_pts3d)} pt(s)")
 
-        # --- Fit laser plane once, then freeze it ---
-        if not hasattr(run_state, 'lp_pt'):
-            run_state.lp_pt   = None
-            run_state.lp_norm = None
-            run_state.acc_top = []
-            run_state.acc_btm = []
+        # --- Fit laser plane fresh every frame from current top/btm hits ---
+        if len(top_pts3d) < 1 or len(btm_pts3d) < 1:
+            print(f"Not enough calibration hits this frame (top={len(top_pts3d)}, btm={len(btm_pts3d)}), skipping")
+            continue
 
-        if run_state.lp_pt is None:
-            run_state.acc_top.extend(top_pts3d)
-            run_state.acc_btm.extend(btm_pts3d)
-
-            if len(run_state.acc_top) < 3 or len(run_state.acc_btm) < 3:
-                print(f"Accumulating... top={len(run_state.acc_top)}/3  btm={len(run_state.acc_btm)}/3")
-                continue
-
-            run_state.lp_pt, run_state.lp_norm = fit_plane_svd(
-                run_state.acc_top + run_state.acc_btm)
-            run_state.acc_top = None   # free — no longer needed
-            run_state.acc_btm = None
-            print(f"Laser plane fitted and frozen.")
-            print(f"  point:  {run_state.lp_pt}")
-            print(f"  normal: {run_state.lp_norm}")
-
-        lp_pt, lp_norm = run_state.lp_pt, run_state.lp_norm
+        lp_pt, lp_norm = fit_plane_svd(top_pts3d + btm_pts3d)
 
         print("Completed the parametrization of Laser Plane")
 

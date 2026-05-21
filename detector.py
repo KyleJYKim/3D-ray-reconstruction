@@ -2,6 +2,7 @@ import numpy as np
 import cv2 as cv
 import json
 
+LASER_THRESH = 30.0   # minimum column red-excess sum to count as laser
 NMS_WINSIZE = 13
 H_SIZE = 512
 
@@ -114,126 +115,106 @@ def decompose_homography(H, K):
 
     return R, t
 
+
 def detect_laser_points(frame, rect_top_img, rect_btm_img):
     """
-    Detect red laser points that fall inside either rectangle and return
-    them as homogeneous image coordinates (x, y, 1).
- 
-    Strategy
-    --------
-    1. Isolate red channel via HSV masking (handles both low- and
-       high-hue red which wraps around 180° in OpenCV).
-    2. Build a binary ROI mask from the two rectangle polygons so we
-       only look inside the calibration targets.
-    3. For each contour in the masked result keep only bright, compact
-       blobs (laser spots are small and very saturated).
-    4. Return the sub-pixel centroid of every accepted blob as (x, y, 1).
-    """
- 
-    # --- 1. Red HSV mask (red wraps: [0,10] ∪ [170,180]) ---
-    hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
- 
-    mask_red1 = cv.inRange(hsv, (0,   50, 50), (10,  255, 255))
-    mask_red2 = cv.inRange(hsv, (170, 50, 50), (180, 255, 255))
-    mask_red  = cv.bitwise_or(mask_red1, mask_red2)
- 
-    # Small morphological cleanup to remove single-pixel noise
-    # kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (3, 3))
-    # mask_red = cv.morphologyEx(mask_red, cv.MORPH_OPEN,  kernel)
-    # mask_red = cv.morphologyEx(mask_red, cv.MORPH_CLOSE, kernel)
+    Detect red laser points across the whole frame and classify each pixel
+    into one of three buckets:
 
-    # --- 2. ROI mask: only pixels inside the two rectangles ---
-    h, w = frame.shape[:2]
-    roi_mask = np.zeros((h, w), dtype=np.uint8)
- 
-    for rect in (rect_top_img, rect_btm_img):
-        pts = rect.reshape(-1, 1, 2).astype(np.int32)
-        cv.fillPoly(roi_mask, [pts], 255)
- 
-    mask_combined = cv.bitwise_and(mask_red, roi_mask)
- 
- 
-    contours, _ = cv.findContours(mask_combined, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    # --- 3. Find blobs, compute sub-pixel centroids, assign to top/btm rect ---
-    # Pre-build the contour arrays once for pointPolygonTest
+      pts_top  — inside the top (wall) calibration rectangle
+      pts_btm  — inside the bottom (table) calibration rectangle
+      pts_obj  — inside the object region between the two rectangles
+
+    All points are returned as homogeneous image coordinates (x, y, 1).
+    """
+
+    # --- 1. Red HSV mask ---
+    hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+    mask_red = cv.inRange(hsv, (165, 50, 50), (175, 180, 180))
+    mask_red = cv.medianBlur(mask_red, 7)
+
+    # --- 2. Region polygons ---
     poly_top = rect_top_img.reshape(-1, 1, 2).astype(np.int32)
     poly_btm = rect_btm_img.reshape(-1, 1, 2).astype(np.int32)
+    poly_obj_region = np.array([
+        rect_top_img[2], rect_top_img[3],
+        rect_btm_img[0], rect_btm_img[1],
+    ], dtype=np.int32).reshape(-1, 1, 2)
 
-    pts_top = []   # homogeneous (x, y, 1) inside top rectangle
-    pts_btm = []   # homogeneous (x, y, 1) inside bottom rectangle
+    # --- 3. Mask per region and gather all non-zero pixels ---
+    h, w = mask_red.shape
 
-    for cnt in contours:
-        area = cv.contourArea(cnt)
-        if area < 2:    # skip single-pixel noise
-            continue
-        if area > 500:  # skip large blobs that are not laser spots
-            continue
+    def region_pts(poly):
+        m = np.zeros((h, w), dtype=np.uint8)
+        cv.fillPoly(m, [poly], 255)
+        raw = cv.findNonZero(cv.bitwise_and(mask_red, m))
+        if raw is None:
+            return []
+        return [np.array([float(p[0][0]), float(p[0][1]), 1.0]) for p in raw]
 
-        M = cv.moments(cnt)
-        if M["m00"] == 0:
-            continue
-
-        cx = M["m10"] / M["m00"]
-        cy = M["m01"] / M["m00"]
-        p  = np.array([cx, cy, 1.0], dtype=np.float64)
-
-        # pointPolygonTest returns >= 0 when the point is on or inside the polygon
-        if cv.pointPolygonTest(poly_top, (cx, cy), measureDist=False) >= 0:
-            pts_top.append(p)
-        elif cv.pointPolygonTest(poly_btm, (cx, cy), measureDist=False) >= 0:
-            pts_btm.append(p)
-        # points outside both rectangles are discarded
+    pts_top = region_pts(poly_top)
+    pts_btm = region_pts(poly_btm)
+    pts_obj = region_pts(poly_obj_region)
 
     # --- 4. Visualisation ---
     vis = frame.copy()
-    cv.polylines(vis, [poly_top], True, (0, 255, 0), 2)   # green = top (wall)
-    cv.polylines(vis, [poly_btm], True, (0, 0, 255), 2)   # blue  = bottom (table)
-    for p in pts_top:
-        cv.circle(vis, (int(p[0]), int(p[1])), 5, (0, 255, 255), -1)   # yellow
-    for p in pts_btm:
-        cv.circle(vis, (int(p[0]), int(p[1])), 5, (255, 0, 255), -1)   # magenta
+    cv.polylines(vis, [poly_top], True, (0, 255, 0), 2)
+    cv.polylines(vis, [poly_btm], True, (0, 0, 255), 2)
+    cv.polylines(vis, [poly_obj_region], True, (255, 255, 0), 1)
+    for p in pts_top[::4]:
+        cv.circle(vis, (int(p[0]), int(p[1])), 2, (0, 255, 255), -1)
+    for p in pts_btm[::4]:
+        cv.circle(vis, (int(p[0]), int(p[1])), 2, (255, 0, 255), -1)
+    for p in pts_obj[::4]:
+        cv.circle(vis, (int(p[0]), int(p[1])), 2, (0, 165, 255), -1)
     cv.imshow("laser points", vis)
-    # cv.waitKey(0)
 
-    return pts_top, pts_btm   # two lists of np.array([x, y, 1])
-
+    return pts_top, pts_btm, pts_obj
 
 
-def ray_plane_intersect(pt_h, K, plane_pt, plane_n):
+def backproject_to_ray(pt, K):
     """
-    Back-project homogeneous image point pt_h = (x, y, 1) and intersect
-    with a plane defined by point plane_pt and unit normal plane_n.
-
-    Ray from camera origin: d = K^{-1} * pt_h  (normalised)
-    Intersection:           t = (plane_pt . plane_n) / (d . plane_n)
-    3D point:               X = t * d
+    Back-project homogeneous image point pt = (x, y, 1)
+    Ray from camera origin: d_vec = K^{-1} * pt  (normalised)
     """
-    d = np.linalg.inv(K) @ pt_h
-    d = d / np.linalg.norm(d)
+    d_vec = np.linalg.inv(K) @ pt
+    d_vec = d_vec / np.linalg.norm(d_vec)
 
-    plane_n   = plane_n.ravel()
-    plane_pt  = plane_pt.ravel()
-    denom     = d @ plane_n
+    return d_vec # (0_vec, d_vec)
+    
+def intersect_ray_plane(d_vec, plane_pt, plane_norm):
+    """
+    Intersect a ray with a plane defined by point plane_pt and unit normal plane_n.
+    plane = (plane_pt, plane_norm)
+    ray = (c, d_vec), where c = 0_vec
+    Intersection: c + z @ d_vec,
+    where z = ((plane_pt - c) @ plane_norm) / d_vec @ plane_norm.
+    Therefore: z = (plane_pt @ plane_norm) / d_vec @ plane_norm
+    """
+
+    plane_pt = plane_pt.ravel()
+    plane_norm = plane_norm.ravel()
+    denom = d_vec @ plane_norm
 
     if abs(denom) < 1e-9:
         print("ray parallel to plane")
         return None
     
-    z = (plane_pt @ plane_n) / denom
+    z = (plane_pt @ plane_norm) / denom
     
     if z < 0:
         print("intersection behind camera")
         z = z * -1
         # return None
     
-    return z * d  # (3,) in camera coordinates
+    return z * d_vec
 
 
-def fit_plane_svd(points_3d: list) -> tuple:
+def fit_plane_svd(points_3d):
     """
     Fit a plane to >= 3 3D points using SVD (least-squares normal).
 
-    Returns (centroid, unit_normal) where the plane is:
+    Returns (mean, unit_normal) where the plane is:
         (X - centroid) . unit_normal = 0
 
     The normal is the right-singular vector corresponding to the
@@ -244,33 +225,35 @@ def fit_plane_svd(points_3d: list) -> tuple:
     _, _, Vt = np.linalg.svd(pts - centroid)
     normal = Vt[-1]                               # last row = smallest singular value
     normal = normal / np.linalg.norm(normal)
+    
     return centroid, normal
 
 
-def intersect_planes(p1, n1, p2, n2) -> tuple:
-    """
-    Intersect two planes to get a 3D line.
+# def intersect_planes(p1, n1, p2, n2) -> tuple:
+#     """
+#     Intersect two planes to get a 3D line.
 
-    Plane 1: (X - p1) . n1 = 0
-    Plane 2: (X - p2) . n2 = 0
+#     Plane 1: (X - p1) . n1 = 0
+#     Plane 2: (X - p2) . n2 = 0
 
-    The line direction is d = n1 x n2.
-    A point on the line is found by solving the 2-plane system
-    with a third constraint (set the component along d to zero).
+#     The line direction is d = n1 x n2.
+#     A point on the line is found by solving the 2-plane system
+#     with a third constraint (set the component along d to zero).
 
-    Returns (point_on_line, direction) or (None, None) if planes are parallel.
-    """
-    d = np.cross(n1, n2)
-    if np.linalg.norm(d) < 1e-9:
-        return None, None           # planes are parallel
-    d = d / np.linalg.norm(d)
+#     Returns (point_on_line, direction) or (None, None) if planes are parallel.
+#     """
+#     d = np.cross(n1, n2)
+#     if np.linalg.norm(d) < 1e-9:
+#         return None, None           # planes are parallel
+#     d = d / np.linalg.norm(d)
 
-    # Solve for a point on the line:
-    # Build 3x3 system [n1; n2; d^T] * x = [n1.p1; n2.p2; 0]
-    A = np.array([n1, n2, d], dtype=np.float64)
-    b = np.array([n1 @ p1, n2 @ p2, 0.0], dtype=np.float64)
-    pt = np.linalg.solve(A, b)
-    return pt, d
+#     # Solve for a point on the line:
+#     # Build 3x3 system [n1; n2; d^T] * x = [n1.p1; n2.p2; 0]
+#     A = np.array([n1, n2, d], dtype=np.float64)
+#     b = np.array([n1 @ p1, n2 @ p2, 0.0], dtype=np.float64)
+#     pt = np.linalg.solve(A, b)
+#     return pt, d
+
 
 
 def main():
@@ -284,9 +267,10 @@ def main():
     rect_H_top = None
     rect_H_btm = None
 
-    # Simple namespace to accumulate 3D points across frames
+    # Simple namespace to accumulate calibration points across frames
     class run_state: pass
 
+    pts_file = open("points_raw.txt", "w")
     running = True
 
     while running:
@@ -303,7 +287,7 @@ def main():
         # Detect only until we have both homographies
         if rect_H_top is None or rect_H_btm is None:
             
-            print("Started the parametrization of Plane 1 and 2")
+            print("Started the parametrization of Plane 1 (top) and 2 (btm)")
             
             rects = detect_rectangle(frame)
             if rects is None:
@@ -312,93 +296,132 @@ def main():
 
             rect_top_img, rect_btm_img = rects
 
-            # findHomography needs (N,1,2) or (N,2); the arrays are (4,2)
-            rect_H_top, mask_top = cv.findHomography(rect_top_img, rect_canonical)
-            rect_H_btm, mask_btm = cv.findHomography(rect_btm_img, rect_canonical)
+            # H must map world to image so decompose_homography gets H = K[r1|r2|t]
+            rect_canonical_2d = rect_canonical[:, :2]   # drop z=0 column
+            rect_H_top, mask_top = cv.findHomography(rect_canonical_2d, rect_top_img)
+            rect_H_btm, mask_btm = cv.findHomography(rect_canonical_2d, rect_btm_img)
 
             print("H_top:\n", rect_H_top)
-            R_top, t_top = decompose_homography(rect_H_top, K)
-            print("R_top:\n", R_top)
-            print("t_top:\n", t_top)
+            top_Rotation, top_translation = decompose_homography(rect_H_top, K)
+            print("top_Rotation:\n", top_Rotation)
+            print("top_translation:\n", top_Rotation)
 
             print("H_btm:\n", rect_H_btm)
-            R_btm, t_btm = decompose_homography(rect_H_btm, K)
-            print("R_btm:\n", R_btm)
-            print("t_btm:\n", t_btm)
+            btm_Rotation, btm_translation = decompose_homography(rect_H_btm, K)
+            print("btm_Rotation:\n", btm_Rotation)
+            print("top_translation:\n", btm_translation)
             
             # the point and normal of the plane
-            p_top = t_top
-            n_top = R_top @ np.array([[0],[0],[1]])
-            p_btm = t_btm
-            n_btm = R_btm @ np.array([[0],[0],[1]])
+            top_pt = top_translation
+            top_normal = top_Rotation @ np.array([[0],[0],[1]])
+            btm_pt = btm_translation
+            btm_normal = btm_Rotation @ np.array([[0],[0],[1]])
             
-            print("p_top:\n", p_top)
-            print("n_top:\n", n_top)
-            print("p_btm:\n", p_btm)
-            print("n_btm:\n", n_btm)
+            print("top_pt:\n", top_pt)
+            print("top_normal:\n", top_normal)
+            print("btm_pt:\n", btm_pt)
+            print("btm_normal:\n", btm_normal)
             
-            print("Completed the parametrization of Plane 1 (top) and 2 (bottom)")
+            print("Completed the parametrization of Plane 1 (top) and 2 (btm)")
         
         print("Started the parametrization of Laser Plane")
 
-        laser_pts_top, laser_pts_btm = detect_laser_points(frame, rect_top_img, rect_btm_img)
+        laser_pts_top, laser_pts_btm, laser_pts_obj = detect_laser_points(frame, rect_top_img, rect_btm_img)
 
-        print(f"Top rect: {len(laser_pts_top)} point(s)  {[p[:2].tolist() for p in laser_pts_top]}")
-        print(f"Bottom rect: {len(laser_pts_btm)} point(s)  {[p[:2].tolist() for p in laser_pts_btm]}")
+        print(f"Top rect:       {len(laser_pts_top)} point(s)  {[p[:2].tolist() for p in laser_pts_top]}")
+        print(f"Btm rect:       {len(laser_pts_btm)} point(s)  {[p[:2].tolist() for p in laser_pts_btm]}")
+        print(f"Obj (others):   {len(laser_pts_obj)} point(s)  {[p[:2].tolist() for p in laser_pts_obj]}")
 
         if K is None:
             continue
 
-        # --- Back-project 2D laser points to 3D via ray-plane intersection ---
-        pts3d_top = []
-        pts3d_btm = []
+        ## Back-project 2D laser points to rays and intersect
+        top_pts3d = []
+        btm_pts3d = []
         
         for p2d in laser_pts_top:
-            p3d = ray_plane_intersect(p2d, K, p_top, n_top)
+            direction = backproject_to_ray(p2d, K)
+            p3d = intersect_ray_plane(direction, top_pt, top_normal)
             if p3d is not None:
-                pts3d_top.append(p3d)
+                top_pts3d.append(p3d)
 
         for p2d in laser_pts_btm:
-            p3d = ray_plane_intersect(p2d, K, p_btm, n_btm)
+            direction = backproject_to_ray(p2d, K)
+            p3d = intersect_ray_plane(direction, btm_pt, btm_normal)
             if p3d is not None:
-                pts3d_btm.append(p3d)
+                btm_pts3d.append(p3d)
 
-        print(f"3D top: {len(pts3d_top)} pt(s)")
-        print(f"3D btm: {len(pts3d_btm)} pt(s)")
+        print(f"3D top: {len(top_pts3d)} pt(s)")
+        print(f"3D btm: {len(btm_pts3d)} pt(s)")
 
-        # --- Accumulate across frames until we have enough points ---
-        if not hasattr(run_state, 'acc_top'):
+        # --- Fit laser plane once, then freeze it ---
+        if not hasattr(run_state, 'lp_pt'):
+            run_state.lp_pt   = None
+            run_state.lp_norm = None
             run_state.acc_top = []
             run_state.acc_btm = []
 
-        run_state.acc_top.extend(pts3d_top)
-        run_state.acc_btm.extend(pts3d_btm)
+        if run_state.lp_pt is None:
+            run_state.acc_top.extend(top_pts3d)
+            run_state.acc_btm.extend(btm_pts3d)
 
-        # Need >= 3 non-collinear points on each plane to fit the laser plane
-        if len(run_state.acc_top) < 3 or len(run_state.acc_btm) < 3:
-            print(f"Accumulating... top={len(run_state.acc_top)}/3  btm={len(run_state.acc_btm)}/3")
-            continue
+            if len(run_state.acc_top) < 3 or len(run_state.acc_btm) < 3:
+                print(f"Accumulating... top={len(run_state.acc_top)}/3  btm={len(run_state.acc_btm)}/3")
+                continue
 
-        # --- Fit laser plane through all accumulated 3D points ---
-        all_pts3d = run_state.acc_top + run_state.acc_btm
-        laser_centroid, laser_normal = fit_plane_svd(all_pts3d)
-        print(f"Laser plane normal: {laser_normal}")
-        print(f"Laser plane point: {laser_centroid}")
+            run_state.lp_pt, run_state.lp_norm = fit_plane_svd(
+                run_state.acc_top + run_state.acc_btm)
+            run_state.acc_top = None   # free — no longer needed
+            run_state.acc_btm = None
+            print(f"Laser plane fitted and frozen.")
+            print(f"  point:  {run_state.lp_pt}")
+            print(f"  normal: {run_state.lp_norm}")
 
-        # --- Intersect laser plane with each calibration plane -> laser line ---
-        line_pt_top, line_dir_top = intersect_planes(
-            laser_centroid, laser_normal, p_top.ravel(), n_top.ravel()
-        )
-        line_pt_btm, line_dir_btm = intersect_planes(
-            laser_centroid, laser_normal, p_btm.ravel(), n_btm.ravel()
-        )
+        lp_pt, lp_norm = run_state.lp_pt, run_state.lp_norm
 
-        if line_pt_top is not None:
-            print(f"  Laser line on wall  : point={line_pt_top}  dir={line_dir_top}")
-        if line_pt_btm is not None:
-            print(f"  Laser line on table : point={line_pt_btm}  dir={line_dir_btm}")
+        print("Completed the parametrization of Laser Plane")
 
-        # Need to find the red line on the object!!! and intersect with laser plane
+        print("Started the accumulation of laser points")
+
+        # --- Intersect object laser rays with the fitted laser plane ---
+        laser_pts3d = []
+        
+        for p2d in laser_pts_top:
+            direction = backproject_to_ray(p2d, K)
+            p3d = intersect_ray_plane(direction, lp_pt, lp_norm)
+            if p3d is not None:
+                laser_pts3d.append(p3d)
+
+        for p2d in laser_pts_btm:
+            direction = backproject_to_ray(p2d, K)
+            p3d = intersect_ray_plane(direction, lp_pt, lp_norm)
+            if p3d is not None:
+                laser_pts3d.append(p3d)
+
+        for p2d in laser_pts_obj:
+            direction = backproject_to_ray(p2d, K)
+            p3d = intersect_ray_plane(direction, lp_pt, lp_norm)
+            if p3d is not None:
+                laser_pts3d.append(p3d)
+
+        for p3d in laser_pts3d:
+            pts_file.write(f"{p3d[0]:.6f} {p3d[1]:.6f} {p3d[2]:.6f}\n")
+        print(f"3D points on laser plane: {len(laser_pts3d)} pt(s)")
+
+        print("Completed the accumulation of laser points")
+
+    pts_file.close()
+
+    # Build PLY: count lines first (O(1) memory), then stream-copy
+    n_pts = sum(1 for _ in open("points_raw.txt"))
+    if n_pts > 0:
+        with open("points_raw.txt") as src, open("laser_scanned_obj.ply", "w") as dst:
+            dst.write("ply\nformat ascii 1.0\n")
+            dst.write(f"element vertex {n_pts}\n")
+            dst.write("property float x\nproperty float y\nproperty float z\nend_header\n")
+            for line in src:
+                dst.write(line)
+        print(f"Saved {n_pts} points to laser_scanned_obj.ply")
 
     analysis_vid.release()
     cv.destroyAllWindows()
